@@ -2,16 +2,23 @@
 Flood zone check using FEMA's official National Flood Hazard Layer (NFHL) API.
 100% free, no API key needed, official government data.
 Docs: https://www.fema.gov/flood-maps/national-flood-hazard-layer
+
+FIX: FEMA's endpoint occasionally times out or throttles under load.
+This version retries a few times with a short backoff before giving up,
+which reduces "error" results caused by transient network issues.
 """
 import requests
+import time
 
 FEMA_NFHL_URL = "https://hazards.fema.gov/gis/nfhl/rest/services/public/NFHL/MapServer/28/query"
 
-# Zones considered high-risk / avoid
 HIGH_RISK_ZONES = {"A", "AE", "AH", "AO", "AR", "A99", "V", "VE"}
 
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 2
 
-def check_flood_zone(lat, lon, timeout=15):
+
+def check_flood_zone(lat, lon, timeout=20):
     """
     Returns dict:
       {
@@ -34,17 +41,23 @@ def check_flood_zone(lat, lon, timeout=15):
         "f": "json",
     }
 
-    try:
-        resp = requests.get(FEMA_NFHL_URL, params=params, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
+    data = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(FEMA_NFHL_URL, params=params, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY_SECONDS)
+            continue
+
+    if data is None:
         return {"status": "error", "zone": None, "is_high_risk": None}
 
     features = data.get("features", [])
     if not features:
-        # No flood layer at this point = FEMA has no mapped data here.
-        # We do NOT assume "safe" - we flag as no_data.
         return {"status": "no_data", "zone": None, "is_high_risk": None}
 
     zone = features[0].get("attributes", {}).get("FLD_ZONE")
