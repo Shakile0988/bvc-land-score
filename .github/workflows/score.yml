@@ -1,0 +1,19 @@
+name: Score Properties
+
+on:
+  repository_dispatch:
+    types: [score-request]
+
+jobs:
+  run-score:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python run_score.py
+        env:
+          LISTINGS_JSON: ${{ toJson(github.event.client_payload.listings) }}
+          WEBHOOK_URL: ${{ github.event.client_payload.webhook_url }}
