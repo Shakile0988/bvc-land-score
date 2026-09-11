@@ -2,12 +2,21 @@
 Paved road check using OpenStreetMap's Overpass API.
 100% free, no API key needed, community-verified map data.
 Docs: https://wiki.openstreetmap.org/wiki/Overpass_API
+
+FIX: Overpass API is notoriously flaky under load (frequent timeouts/errors).
+This version retries against multiple public Overpass mirrors before
+giving up, which dramatically reduces "error" / "unknown" results.
 """
 import requests
+import time
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Multiple public Overpass mirrors - try each before giving up
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+]
 
-# OSM surface tags considered "paved"
 PAVED_SURFACES = {
     "paved", "asphalt", "concrete", "concrete:plates",
     "concrete:lanes", "paving_stones", "sett", "cobblestone"
@@ -18,6 +27,30 @@ UNPAVED_SURFACES = {
 }
 
 SEARCH_RADIUS_M = 60  # look for nearest road within 60 meters
+MAX_RETRIES_PER_MIRROR = 2
+RETRY_DELAY_SECONDS = 2
+
+
+def _query_overpass(lat, lon, timeout):
+    query = f"""
+    [out:json][timeout:20];
+    way(around:{SEARCH_RADIUS_M},{lat},{lon})["highway"];
+    out tags;
+    """
+
+    last_error = None
+    for url in OVERPASS_URLS:
+        for attempt in range(MAX_RETRIES_PER_MIRROR):
+            try:
+                resp = requests.post(url, data={"data": query}, timeout=timeout)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_error = e
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+    # All mirrors failed
+    raise last_error if last_error else RuntimeError("Overpass request failed")
 
 
 def check_paved_road(lat, lon, timeout=25):
@@ -33,16 +66,8 @@ def check_paved_road(lat, lon, timeout=25):
     if lat is None or lon is None:
         return {"status": "no_data", "surface": "unknown", "highway_type": None}
 
-    query = f"""
-    [out:json][timeout:20];
-    way(around:{SEARCH_RADIUS_M},{lat},{lon})["highway"];
-    out tags;
-    """
-
     try:
-        resp = requests.post(OVERPASS_URL, data={"data": query}, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _query_overpass(lat, lon, timeout)
     except Exception:
         return {"status": "error", "surface": "unknown", "highway_type": None}
 
@@ -50,7 +75,6 @@ def check_paved_road(lat, lon, timeout=25):
     if not elements:
         return {"status": "no_data", "surface": "unknown", "highway_type": None}
 
-    # Take the first nearby way's tags
     tags = elements[0].get("tags", {})
     highway_type = tags.get("highway")
     surface = tags.get("surface")
@@ -64,7 +88,6 @@ def check_paved_road(lat, lon, timeout=25):
         return {"status": "ok", "surface": "unknown", "highway_type": highway_type}
 
     # No explicit surface tag - infer conservatively from highway class only
-    # (primary/secondary/tertiary/residential are almost always paved in the US)
     likely_paved_classes = {
         "primary", "secondary", "tertiary", "residential",
         "trunk", "motorway", "unclassified"
