@@ -9,6 +9,7 @@ giving up, which dramatically reduces "error" / "unknown" results.
 """
 import requests
 import time
+import sys
 
 # Multiple public Overpass mirrors - try each before giving up
 OVERPASS_URLS = [
@@ -43,13 +44,24 @@ def _query_overpass(lat, lon, timeout):
         for attempt in range(MAX_RETRIES_PER_MIRROR):
             try:
                 resp = requests.post(url, data={"data": query}, timeout=timeout)
+                status_code = resp.status_code
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
                 last_error = e
+                print(
+                    f"[road check] mirror={url} attempt {attempt + 1}/{MAX_RETRIES_PER_MIRROR} "
+                    f"failed for ({lat},{lon}): {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
     # All mirrors failed
+    print(
+        f"[road check] ALL MIRRORS FAILED for ({lat},{lon}). "
+        f"last_error={type(last_error).__name__ if last_error else None}: {last_error}",
+        file=sys.stderr,
+    )
     raise last_error if last_error else RuntimeError("Overpass request failed")
 
 
