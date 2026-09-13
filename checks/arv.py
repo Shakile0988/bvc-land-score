@@ -13,9 +13,15 @@ of different ZIP codes with only 1-2 per ZIP. Requiring 3+ comps in the
 EXACT same ZIP almost always fails ("insufficient_comps") even with 50+
 listings scraped, because they're spread out. Using a radius instead finds
 comps across nearby ZIPs, so ARV can actually be computed in practice.
-COMP_RADIUS_MILES is tunable - widen it if you still get too many
-"insufficient_comps" results, narrow it if comps feel too far apart to be
-realistic for land pricing.
+
+COMP_RADII_MILES is an escalating list, not a single fixed value: it tries
+20mi first (most locally accurate), then 40mi, then 75mi, stopping as soon
+as MIN_COMPS is met. This means a property in a dense area still gets a
+tight, realistic radius, while a property in a sparse area (typical for
+a state-wide scrape) still gets an ARV instead of "insufficient_comps" every
+time. Adjust the list if you still see too many insufficient_comps results
+(add a larger final radius) or if far-flung comps feel unrealistic for land
+pricing (remove the largest radius).
 
 Limitation (stated honestly): these are ASKING prices of active listings,
 not confirmed SOLD prices. True ARV should ideally use sold comps
@@ -29,7 +35,14 @@ a guess.
 import math
 
 MIN_COMPS = 3
-COMP_RADIUS_MILES = 20
+
+# Escalating radii: try the tightest (most locally accurate) radius first,
+# widen only if it doesn't find enough comps. A single fixed 20mi radius
+# was failing constantly on state-wide scrapes where listings land in
+# dozens of ZIPs with only 1-2 per ZIP - most points never had 3 comps
+# within 20mi. Capping at 75mi keeps "comp" still meaning something for
+# land pricing rather than comparing across the whole state.
+COMP_RADII_MILES = [20, 40, 75]
 
 
 def _acres(listing):
@@ -73,7 +86,9 @@ def estimate_arv(listing, all_listings):
     if price is None or lat is None or lon is None or this_acres is None or this_acres <= 0:
         return {"status": "no_data", "arv": None, "comps_used": 0, "price_to_arv_ratio": None}
 
-    comps = []
+    # Pre-compute distance + price-per-acre once per candidate, then just
+    # filter by radius at each escalation step instead of re-scanning.
+    candidates = []
     for other in all_listings:
         if other is listing:
             continue
@@ -81,13 +96,20 @@ def estimate_arv(listing, all_listings):
         other_lat, other_lon = other_coords.get("latitude"), other_coords.get("longitude")
         if other_lat is None or other_lon is None:
             continue
-        if _miles_between(lat, lon, other_lat, other_lon) > COMP_RADIUS_MILES:
-            continue
         other_price = (other.get("listingPrice") or {}).get("amount")
         other_acres = _acres(other)
         if other_price is None or other_acres is None or other_acres <= 0:
             continue
-        comps.append(other_price / other_acres)
+        dist = _miles_between(lat, lon, other_lat, other_lon)
+        candidates.append((dist, other_price / other_acres))
+
+    comps = []
+    radius_used = None
+    for radius in COMP_RADII_MILES:
+        comps = [ppa for dist, ppa in candidates if dist <= radius]
+        radius_used = radius
+        if len(comps) >= MIN_COMPS:
+            break
 
     if len(comps) < MIN_COMPS:
         return {
@@ -111,5 +133,6 @@ def estimate_arv(listing, all_listings):
         "status": "ok",
         "arv": round(arv, 2),
         "comps_used": len(comps),
+        "comp_radius_miles": radius_used,
         "price_to_arv_ratio": round(ratio, 3) if ratio is not None else None,
     }
