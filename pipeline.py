@@ -57,15 +57,35 @@ def score_property(listing, all_listings):
     score = 0
     breakdown = {}
 
-    # 1. Lot size <= 0.5 acre
+    # 1. Lot size <= 0.5 acre -- HARD FILTER, not just a weighted point.
+    # Client's rule is "residential lots <= 1/2 acre ONLY" - anything bigger
+    # should never qualify no matter how well it scores elsewhere. Rejecting
+    # here also skips the slow FEMA + Overpass calls below for the many
+    # multi-acre listings in a typical Zillow scrape, which is most of why
+    # a 50-listing GitHub Action run can take a long time.
     if acres is None:
         data_gaps.append("lot_size_missing")
         breakdown["lot_size"] = None
+    elif acres > 0.5:
+        return {
+            "address": address.get("full"),
+            "price": price,
+            "acres": acres,
+            "score": 0,
+            "qualified": False,
+            "breakdown": {"lot_size": False},
+            "flood_zone": None,
+            "road_surface": None,
+            "zoning_hint": None,
+            "arv_estimate": None,
+            "comps_used": None,
+            "data_gaps": ["lot_size_over_0.5_acre"],
+            "zpid": listing.get("zpid"),
+            "url": listing.get("propertyUrl"),
+        }
     else:
-        passed = acres <= 0.5
-        breakdown["lot_size"] = passed
-        if passed:
-            score += WEIGHTS["lot_size"]
+        breakdown["lot_size"] = True
+        score += WEIGHTS["lot_size"]
 
     # 2. Flood zone (FEMA - real check)
     flood = check_flood_zone(lat, lon)
