@@ -3,46 +3,37 @@ ARV (After Repair Value) estimation - using REAL comps, not guesses.
 
 Approach: instead of an invented formula, we use the batch of listings
 n8n already scraped from Zillow as real comparable data. For each property,
-we look at OTHER active listings within a RADIUS (miles, not ZIP code) and
-compute the median price-per-acre. That median x this lot's acreage = a
-real, data-backed ARV estimate.
+we look at OTHER active listings within a RADIUS (miles) AND a similar
+ACREAGE TIER, and compute the median price-per-acre. That median x this
+lot's acreage = a real, data-backed ARV estimate.
 
-WHY RADIUS INSTEAD OF ZIP:
-When scraping is state-wide (e.g. all of Georgia), listings land in dozens
-of different ZIP codes with only 1-2 per ZIP. Requiring 3+ comps in the
-EXACT same ZIP almost always fails ("insufficient_comps") even with 50+
-listings scraped, because they're spread out. Using a radius instead finds
-comps across nearby ZIPs, so ARV can actually be computed in practice.
+CRITICAL FIX: price-per-acre is NOT scale-invariant for land. A 0.04-acre
+buildable lot and a 46-acre rural tract do not trade at the same $/acre -
+small parcels command a huge premium per acre. The old version pooled ALL
+listings together regardless of size, so small qualifying lots (<=0.5 acre)
+got their ARV computed from mostly large rural-acreage comps, producing
+absurdly low ARVs (e.g. $1,394 for a real $85K listing). Comps are now
+restricted to a size band around the subject property before the radius
+escalation runs, so a small lot is only ever compared to other small lots.
 
-COMP_RADII_MILES is an escalating list, not a single fixed value: it tries
-20mi first (most locally accurate), then 40mi, then 75mi, stopping as soon
-as MIN_COMPS is met. This means a property in a dense area still gets a
-tight, realistic radius, while a property in a sparse area (typical for
-a state-wide scrape) still gets an ARV instead of "insufficient_comps" every
-time. Adjust the list if you still see too many insufficient_comps results
-(add a larger final radius) or if far-flung comps feel unrealistic for land
-pricing (remove the largest radius).
+WHY RADIUS INSTEAD OF ZIP: state-wide scrapes land in dozens of ZIPs with
+only 1-2 listings each, so "3+ comps in the exact ZIP" almost always fails.
+A radius (escalating 20mi -> 40mi -> 75mi) finds comps across nearby ZIPs
+while staying inside the same acreage tier.
 
 Limitation (stated honestly): these are ASKING prices of active listings,
-not confirmed SOLD prices. True ARV should ideally use sold comps
-(e.g. via a paid service like ATTOM or Redfin sold data). This free
-version is a reasonable proxy only when enough nearby comps exist.
-If fewer than MIN_COMPS are found within the radius, status =
-"insufficient_comps" and the property should be skipped, not scored on
-a guess.
+not confirmed SOLD prices. This is a reasonable free proxy only when
+enough same-tier nearby comps exist.
 """
 
 import math
 
 MIN_COMPS = 3
-
-# Escalating radii: try the tightest (most locally accurate) radius first,
-# widen only if it doesn't find enough comps. A single fixed 20mi radius
-# was failing constantly on state-wide scrapes where listings land in
-# dozens of ZIPs with only 1-2 per ZIP - most points never had 3 comps
-# within 20mi. Capping at 75mi keeps "comp" still meaning something for
-# land pricing rather than comparing across the whole state.
 COMP_RADII_MILES = [20, 40, 75]
+
+ACREAGE_BAND_LOW_MULT = 0.3
+ACREAGE_BAND_HIGH_MULT = 3.0
+ACREAGE_BAND_MIN_WIDTH = 0.25  # acres
 
 
 def _acres(listing):
@@ -60,12 +51,22 @@ def _acres(listing):
 
 def _miles_between(lat1, lon1, lat2, lon2):
     """Haversine distance in miles between two lat/lon points."""
-    R = 3958.8  # earth radius in miles
+    R = 3958.8
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
+
+
+def _acreage_band(this_acres):
+    low = this_acres * ACREAGE_BAND_LOW_MULT
+    high = this_acres * ACREAGE_BAND_HIGH_MULT
+    if (high - low) < ACREAGE_BAND_MIN_WIDTH:
+        pad = (ACREAGE_BAND_MIN_WIDTH - (high - low)) / 2
+        low -= pad
+        high += pad
+    return max(low, 0.0001), high
 
 
 def estimate_arv(listing, all_listings):
@@ -86,8 +87,8 @@ def estimate_arv(listing, all_listings):
     if price is None or lat is None or lon is None or this_acres is None or this_acres <= 0:
         return {"status": "no_data", "arv": None, "comps_used": 0, "price_to_arv_ratio": None}
 
-    # Pre-compute distance + price-per-acre once per candidate, then just
-    # filter by radius at each escalation step instead of re-scanning.
+    band_low, band_high = _acreage_band(this_acres)
+
     candidates = []
     for other in all_listings:
         if other is listing:
@@ -99,6 +100,8 @@ def estimate_arv(listing, all_listings):
         other_price = (other.get("listingPrice") or {}).get("amount")
         other_acres = _acres(other)
         if other_price is None or other_acres is None or other_acres <= 0:
+            continue
+        if not (band_low <= other_acres <= band_high):
             continue
         dist = _miles_between(lat, lon, other_lat, other_lon)
         candidates.append((dist, other_price / other_acres))
