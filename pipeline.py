@@ -6,13 +6,18 @@ Client rules being enforced:
   - Min ARV $40K+
   - Price <= 65% of ARV
   - Paved road (dirt road = skip)
-  - Not in flood zone
+  - Not in flood zone (confirmed flood zone = HARD REJECT, never "review")
   - Comp lots nearby selling $40K+
 
 SCORING PHILOSOPHY:
   If a required data point is missing/unverifiable, that check contributes
   ZERO points and is logged in "data_gaps" - it does NOT get assumed as
   pass or fail. This keeps scores honest instead of guessed.
+
+  EXCEPTION: if a check comes back with a CONFIRMED negative result
+  (e.g. flood zone is definitely high-risk), that is not a "gap" - it's
+  a known fact, and the client's rule says never chase it. So it hard-
+  rejects immediately instead of falling into needs_review.
 """
 
 from checks.flood import check_flood_zone
@@ -32,6 +37,12 @@ WEIGHTS = {
     "comp_value_40k": 100,
 }
 
+# Gaps in this set are informational only and never block qualification.
+# Zoning is excluded from scoring entirely (see checks/zoning.py docstring -
+# free data is unreliable for it), so an unknown zoning hint must not sit
+# in data_gaps and silently zero out every qualified result.
+NON_BLOCKING_GAPS = {"zoning_unknown"}
+
 
 def _acres(listing):
     lot = listing.get("lotArea") or {}
@@ -46,6 +57,31 @@ def _acres(listing):
     return None
 
 
+def _reject(listing, address, price, acres, reason_gap, extra=None):
+    """Build a hard-rejected result. Used for both the lot-size hard filter
+    and the confirmed-flood-zone hard filter, so both reasons are visible
+    directly in the rejected bucket instead of leaking into needs_review."""
+    base = {
+        "address": address.get("full"),
+        "price": price,
+        "acres": acres,
+        "score": 0,
+        "qualified": False,
+        "breakdown": {"lot_size": None},
+        "flood_zone": None,
+        "road_surface": None,
+        "zoning_hint": None,
+        "arv_estimate": None,
+        "comps_used": None,
+        "data_gaps": [reason_gap],
+        "zpid": listing.get("zpid"),
+        "url": listing.get("propertyUrl"),
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
 def score_property(listing, all_listings):
     address = listing.get("listingAddress", {})
     coords = listing.get("coordinates") or {}
@@ -58,45 +94,40 @@ def score_property(listing, all_listings):
     breakdown = {}
 
     # 1. Lot size <= 0.5 acre -- HARD FILTER, not just a weighted point.
-    # Client's rule is "residential lots <= 1/2 acre ONLY" - anything bigger
-    # should never qualify no matter how well it scores elsewhere. Rejecting
-    # here also skips the slow FEMA + Overpass calls below for the many
-    # multi-acre listings in a typical Zillow scrape, which is most of why
-    # a 50-listing GitHub Action run can take a long time.
     if acres is None:
         data_gaps.append("lot_size_missing")
         breakdown["lot_size"] = None
     elif acres > 0.5:
-        return {
-            "address": address.get("full"),
-            "price": price,
-            "acres": acres,
-            "score": 0,
-            "qualified": False,
-            "breakdown": {"lot_size": False},
-            "flood_zone": None,
-            "road_surface": None,
-            "zoning_hint": None,
-            "arv_estimate": None,
-            "comps_used": None,
-            "data_gaps": ["lot_size_over_0.5_acre"],
-            "zpid": listing.get("zpid"),
-            "url": listing.get("propertyUrl"),
-        }
+        return _reject(
+            listing, address, price, acres,
+            "lot_size_over_0.5_acre",
+            extra={"breakdown": {"lot_size": False}},
+        )
     else:
         breakdown["lot_size"] = True
         score += WEIGHTS["lot_size"]
 
     # 2. Flood zone (FEMA - real check)
+    # If the check couldn't run at all, that's a genuine data gap -> review.
+    # If it DID run and confirms high-risk, that's not a gap, it's a known
+    # fact -> hard reject immediately per client rule ("never chase flood
+    # zone lots"). Only a confirmed low-risk zone earns the scoring points.
     flood = check_flood_zone(lat, lon)
     if flood["status"] != "ok":
         data_gaps.append(f"flood_check_{flood['status']}")
         breakdown["not_flood_zone"] = None
+    elif flood["is_high_risk"]:
+        return _reject(
+            listing, address, price, acres,
+            "flood_zone_confirmed_high_risk",
+            extra={
+                "breakdown": {"lot_size": breakdown["lot_size"], "not_flood_zone": False},
+                "flood_zone": flood.get("zone"),
+            },
+        )
     else:
-        passed = not flood["is_high_risk"]
-        breakdown["not_flood_zone"] = passed
-        if passed:
-            score += WEIGHTS["not_flood_zone"]
+        breakdown["not_flood_zone"] = True
+        score += WEIGHTS["not_flood_zone"]
 
     # 3. Paved road (OpenStreetMap - real check)
     road = check_paved_road(lat, lon)
@@ -129,7 +160,7 @@ def score_property(listing, all_listings):
 
     # 5. Comp lots nearby selling $40K+ (median comp price itself)
     if arv_result["status"] == "ok" and arv_result["comps_used"] >= 3:
-        comp_value_ok = arv_result["arv"] is not None  # already implies comps exist
+        comp_value_ok = arv_result["arv"] is not None
         breakdown["comp_value_40k"] = comp_value_ok
         if comp_value_ok and arv_result["arv"] >= 40000:
             score += WEIGHTS["comp_value_40k"]
@@ -142,7 +173,11 @@ def score_property(listing, all_listings):
     if zoning["status"] == "no_data":
         data_gaps.append("zoning_unknown")
 
-    qualified = score >= QUALIFY_THRESHOLD and len(data_gaps) == 0
+    # Qualification only blocks on REAL/blocking gaps. zoning_unknown is
+    # informational-only per client instructions and must not zero out
+    # every result just because free zoning data rarely exists.
+    blocking_gaps = [g for g in data_gaps if g not in NON_BLOCKING_GAPS]
+    qualified = score >= QUALIFY_THRESHOLD and len(blocking_gaps) == 0
 
     return {
         "address": address.get("full"),
@@ -166,9 +201,9 @@ def run_pipeline(listings):
     """
     listings: list of raw Zillow property dicts (as scraped by Apify)
     Returns: {
-      "qualified": [...],      # score >= 70 AND no data gaps
-      "needs_review": [...],   # score >= 70 BUT has data gaps (don't trust blindly)
-      "rejected": [...],       # score < 70
+      "qualified": [...],      # score >= 70 AND no BLOCKING data gaps
+      "needs_review": [...],   # score >= 70 BUT has a blocking data gap
+      "rejected": [...],       # score < 70, OR hard-rejected (lot size / confirmed flood zone)
       "summary": {...}
     }
     """
@@ -177,7 +212,9 @@ def run_pipeline(listings):
     qualified = [r for r in results if r["qualified"]]
     needs_review = [
         r for r in results
-        if not r["qualified"] and r["score"] >= QUALIFY_THRESHOLD and r["data_gaps"]
+        if not r["qualified"]
+        and r["score"] >= QUALIFY_THRESHOLD
+        and any(g not in NON_BLOCKING_GAPS for g in r["data_gaps"])
     ]
     rejected = [
         r for r in results
