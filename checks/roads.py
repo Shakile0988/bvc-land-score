@@ -7,6 +7,7 @@ FIX: Overpass API is notoriously flaky under load (frequent timeouts/errors).
 This version retries against multiple public Overpass mirrors before
 giving up, which dramatically reduces "error" / "unknown" results.
 """
+import random
 import requests
 import time
 import sys
@@ -17,6 +18,14 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
+
+# Overpass's usage policy (https://wiki.openstreetmap.org/wiki/Overpass_API)
+# explicitly asks clients to identify themselves. requests' default
+# "python-requests/x.y" User-Agent is a common trigger for silent
+# throttling/blocking on shared mirrors - this fixes that.
+REQUEST_HEADERS = {
+    "User-Agent": "BVC-Land-Score/1.0 (contact: bluevalleyfunds.fund)"
+}
 
 PAVED_SURFACES = {
     "paved", "asphalt", "concrete", "concrete:plates",
@@ -40,10 +49,14 @@ def _query_overpass(lat, lon, timeout):
     """
 
     last_error = None
-    for url in OVERPASS_URLS:
+    mirrors = OVERPASS_URLS[:]
+    random.shuffle(mirrors)  # spread load instead of always hammering the same mirror first
+    for url in mirrors:
         for attempt in range(MAX_RETRIES_PER_MIRROR):
             try:
-                resp = requests.post(url, data={"data": query}, timeout=timeout)
+                resp = requests.post(
+                    url, data={"data": query}, headers=REQUEST_HEADERS, timeout=timeout
+                )
                 status_code = resp.status_code
                 resp.raise_for_status()
                 return resp.json()
@@ -54,7 +67,7 @@ def _query_overpass(lat, lon, timeout):
                     f"failed for ({lat},{lon}): {type(e).__name__}: {e}",
                     file=sys.stderr,
                 )
-                time.sleep(RETRY_DELAY_SECONDS)
+                time.sleep(RETRY_DELAY_SECONDS + random.uniform(0, 1))
                 continue
     # All mirrors failed
     print(
