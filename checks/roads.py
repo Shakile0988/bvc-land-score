@@ -3,9 +3,22 @@ Paved road check using OpenStreetMap's Overpass API.
 100% free, no API key needed, community-verified map data.
 Docs: https://wiki.openstreetmap.org/wiki/Overpass_API
 
-FIX: Overpass API is notoriously flaky under load (frequent timeouts/errors).
+FIX 1: Overpass API is notoriously flaky under load (frequent timeouts/errors).
 This version retries against multiple public Overpass mirrors before
 giving up, which dramatically reduces "error" / "unknown" results.
+
+FIX 2 (critical): most US residential streets in OSM have NO explicit
+`surface=` tag at all - only a `highway=` class (residential, tertiary,
+etc). The old logic returned status="ok" + surface="unknown" whenever the
+surface tag was missing, which pipeline.py then treated as a BLOCKING data
+gap - so almost every property failed the paved_road check even when the
+road was obviously paved (e.g. `highway=residential` in a subdivision).
+Now, when there's no explicit surface tag, we make a definitive call from
+highway_type instead of returning "unknown":
+  - highway_type in PAVED_HIGHWAY_CLASSES  -> surface = "paved"
+  - highway_type in UNPAVED_HIGHWAY_CLASSES -> surface = "unpaved"
+  - anything else / no tags at all         -> status = "no_data" (real gap)
+"surface unknown" with status="ok" should now be rare-to-never.
 """
 import random
 import requests
@@ -19,10 +32,6 @@ OVERPASS_URLS = [
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
 
-# Overpass's usage policy (https://wiki.openstreetmap.org/wiki/Overpass_API)
-# explicitly asks clients to identify themselves. requests' default
-# "python-requests/x.y" User-Agent is a common trigger for silent
-# throttling/blocking on shared mirrors - this fixes that.
 REQUEST_HEADERS = {
     "User-Agent": "BVC-Land-Score/1.0 (contact: bluevalleyfunds.fund)"
 }
@@ -34,6 +43,19 @@ PAVED_SURFACES = {
 UNPAVED_SURFACES = {
     "unpaved", "dirt", "gravel", "ground", "grass",
     "sand", "clay", "compacted", "earth"
+}
+
+# Used ONLY when the surface tag is missing - inferred from road class.
+# These are the highway classes that are virtually always paved in the US.
+PAVED_HIGHWAY_CLASSES = {
+    "primary", "secondary", "tertiary", "residential",
+    "trunk", "motorway", "unclassified", "living_street",
+    "primary_link", "secondary_link", "tertiary_link",
+    "trunk_link", "motorway_link",
+}
+# These are almost always unpaved/undeveloped access.
+UNPAVED_HIGHWAY_CLASSES = {
+    "track", "path", "bridleway", "footway",
 }
 
 SEARCH_RADIUS_M = 60  # look for nearest road within 60 meters
@@ -50,14 +72,13 @@ def _query_overpass(lat, lon, timeout):
 
     last_error = None
     mirrors = OVERPASS_URLS[:]
-    random.shuffle(mirrors)  # spread load instead of always hammering the same mirror first
+    random.shuffle(mirrors)
     for url in mirrors:
         for attempt in range(MAX_RETRIES_PER_MIRROR):
             try:
                 resp = requests.post(
                     url, data={"data": query}, headers=REQUEST_HEADERS, timeout=timeout
                 )
-                status_code = resp.status_code
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
@@ -69,7 +90,6 @@ def _query_overpass(lat, lon, timeout):
                 )
                 time.sleep(RETRY_DELAY_SECONDS + random.uniform(0, 1))
                 continue
-    # All mirrors failed
     print(
         f"[road check] ALL MIRRORS FAILED for ({lat},{lon}). "
         f"last_error={type(last_error).__name__ if last_error else None}: {last_error}",
@@ -86,7 +106,7 @@ def check_paved_road(lat, lon, timeout=25):
         "surface": "paved" | "unpaved" | "unknown",
         "highway_type": str | None
       }
-    Never guesses paved if no tag is found - returns "unknown" instead.
+    "unknown" should now only appear alongside status != "ok".
     """
     if lat is None or lon is None:
         return {"status": "no_data", "surface": "unknown", "highway_type": None}
@@ -104,20 +124,20 @@ def check_paved_road(lat, lon, timeout=25):
     highway_type = tags.get("highway")
     surface = tags.get("surface")
 
+    # 1. Explicit surface tag - trust it directly (unchanged behavior).
     if surface:
         surface_l = surface.lower()
         if surface_l in PAVED_SURFACES:
             return {"status": "ok", "surface": "paved", "highway_type": highway_type}
         if surface_l in UNPAVED_SURFACES:
             return {"status": "ok", "surface": "unpaved", "highway_type": highway_type}
-        return {"status": "ok", "surface": "unknown", "highway_type": highway_type}
+        # unrecognized surface tag value - fall through to highway_type inference
 
-    # No explicit surface tag - infer conservatively from highway class only
-    likely_paved_classes = {
-        "primary", "secondary", "tertiary", "residential",
-        "trunk", "motorway", "unclassified"
-    }
-    if highway_type in likely_paved_classes:
-        return {"status": "ok", "surface": "unknown", "highway_type": highway_type}
+    # 2. No usable surface tag - make a definitive call from road class.
+    if highway_type in PAVED_HIGHWAY_CLASSES:
+        return {"status": "ok", "surface": "paved", "highway_type": highway_type}
+    if highway_type in UNPAVED_HIGHWAY_CLASSES:
+        return {"status": "ok", "surface": "unpaved", "highway_type": highway_type}
 
+    # 3. Genuinely no signal at all (e.g. highway=service with no other info)
     return {"status": "no_data", "surface": "unknown", "highway_type": highway_type}
