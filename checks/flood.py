@@ -7,6 +7,7 @@ FIX: FEMA's endpoint occasionally times out or throttles under load.
 This version retries a few times with a short backoff before giving up,
 which reduces "error" results caused by transient network issues.
 """
+import random
 import requests
 import time
 import sys
@@ -17,6 +18,12 @@ HIGH_RISK_ZONES = {"A", "AE", "AH", "AO", "AR", "A99", "V", "VE"}
 
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
+
+# A generic default User-Agent is more likely to get quietly rate-limited
+# by government-hosted APIs behind bot protection than an identified one.
+REQUEST_HEADERS = {
+    "User-Agent": "BVC-Land-Score/1.0 (contact: bluevalleyfunds.fund)"
+}
 
 
 def check_flood_zone(lat, lon, timeout=20):
@@ -47,7 +54,9 @@ def check_flood_zone(lat, lon, timeout=20):
     last_status_code = None
     for attempt in range(MAX_RETRIES):
         try:
-            resp = requests.get(FEMA_NFHL_URL, params=params, timeout=timeout)
+            resp = requests.get(
+                FEMA_NFHL_URL, params=params, headers=REQUEST_HEADERS, timeout=timeout
+            )
             last_status_code = resp.status_code
             resp.raise_for_status()
             data = resp.json()
@@ -61,7 +70,7 @@ def check_flood_zone(lat, lon, timeout=20):
                 file=sys.stderr,
             )
             if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY_SECONDS)
+                time.sleep(RETRY_DELAY_SECONDS + random.uniform(0, 1))
             continue
 
     if data is None:
